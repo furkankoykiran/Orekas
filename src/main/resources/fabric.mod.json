@@ -1,24 +1,26 @@
 {
   "schemaVersion": 1,
-  "id": "addon-template",
+  "id": "orekas",
   "version": "${version}",
-  "name": "Addon Template",
-  "description": "An addon template for Meteor Client addons.",
+  "name": "Orekas",
+  "description": "Ore-vein ESP for Meteor Client, powered by orefinder.gg's WASM model with live-world validation and an anti-xray fallback heuristic.",
   "authors": [
-    "seasnail"
+    "Webrekas"
   ],
   "contact": {
-    "sources": "https://github.com/MeteorDevelopment/meteor-addon-template"
+    "sources": "https://github.com/furkankoykiran/Orekas",
+    "issues": "https://github.com/furkankoykiran/Orekas/issues"
   },
-  "icon": "assets/template/icon.png",
+  "license": "GPL-3.0-only",
+  "icon": "assets/orekas/icon.png",
   "environment": "client",
   "entrypoints": {
     "meteor": [
-      "com.example.addon.AddonTemplate"
+      "com.webrekas.addon.OrekasAddon"
     ]
   },
   "mixins": [
-    "addon-template.mixins.json"
+    "orekas.mixins.json"
   ],
   "custom": {
     "meteor-client:color": "225,25,25",
