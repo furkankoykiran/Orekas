@@ -12,6 +12,12 @@ loom = "1.14-SNAPSHOT"
 # Meteor (https://github.com/MeteorDevelopment/meteor-client/)
 meteor = "1.21.11-SNAPSHOT"
 
+# Chicory — pure-Java WebAssembly runtime (https://chicory.dev)
+chicory = "1.7.5"
+
+# JUnit 5 (test-only)
+junit = "5.11.3"
+
 # Mods
 
 [libraries]
@@ -22,6 +28,13 @@ fabric-loader = { module = "net.fabricmc:fabric-loader", version.ref = "fabric-l
 
 # Meteor client
 meteor-client = { module = "meteordevelopment:meteor-client", version.ref = "meteor" }
+
+# Chicory WASM runtime
+chicory-runtime = { module = "com.dylibso.chicory:runtime", version.ref = "chicory" }
+
+# JUnit 5 BOM + engine
+junit-bom = { module = "org.junit:junit-bom", version.ref = "junit" }
+junit-jupiter = { module = "org.junit.jupiter:junit-jupiter" }
 
 # Mods
 

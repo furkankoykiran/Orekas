@@ -1,0 +1,25 @@
+rust_bg.wasm
+=============
+
+This file is the Rust-compiled WebAssembly module used by the OreFinder module.
+It is bundled as-is from orefinder.gg, which computes Minecraft ore positions
+entirely client-side (no server API exists).
+
+Upstream URL (content-hashed, may rotate):
+    https://www.orefinder.gg/_astro/rust_bg-rJYknqiq.wasm
+
+Captured on: 2026-04-24
+Size: 2725103 bytes
+SHA-256: 11a94eeacec5bb382995467d456d21ea1eff3ddf1c000c80c3336359759648e1
+
+Source crate: closed ("cb3", per debug paths inside the binary).
+Compiled via: wasm-bindgen 0.2.117.
+
+Credit: orefinder.gg — the ore-finding algorithm and its Minecraft worldgen port
+are their work. This addon simply runs their published WASM in-process so Meteor
+users can see the same results overlaid in-game instead of copy-pasting
+coordinates from a browser tab.
+
+To refresh: run `./gradlew refreshWasm` (or `curl -o` manually) and update the
+size + SHA-256 above. Bump the mod version whenever the binary changes, since
+ore distribution can differ between WASM revisions.
