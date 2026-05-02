@@ -10,7 +10,7 @@ fabric-loader = "0.18.2"
 loom = "1.14-SNAPSHOT"
 
 # Meteor (https://github.com/MeteorDevelopment/meteor-client/)
-meteor = "1.21.11-SNAPSHOT"
+meteor = "26.1.2-SNAPSHOT"
 
 # Chicory — pure-Java WebAssembly runtime (https://chicory.dev)
 chicory = "1.7.5"
