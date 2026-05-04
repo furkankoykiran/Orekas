@@ -39,7 +39,4 @@ jobs:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
           generate_release_notes: true
-          files: |
-            build/libs/*.jar
-            !build/libs/*-dev-shadow.jar
-            !build/libs/*-sources.jar
+          files: build/libs/*[0-9].jar
