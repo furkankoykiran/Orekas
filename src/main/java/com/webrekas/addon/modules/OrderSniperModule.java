@@ -4,6 +4,7 @@ import com.webrekas.addon.OrekasAddon;
 import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.settings.*;
 import meteordevelopment.meteorclient.systems.modules.Module;
+import meteordevelopment.meteorclient.systems.modules.Modules;
 import meteordevelopment.meteorclient.utils.player.ChatUtils;
 import meteordevelopment.orbit.EventHandler;
 import net.minecraft.client.gui.screen.ingame.GenericContainerScreen;
@@ -63,6 +64,7 @@ public class OrderSniperModule extends Module {
 
     private final SettingGroup sgGeneral   = settings.getDefaultGroup();
     private final SettingGroup sgBlacklist = settings.createGroup("Blacklist");
+    private final SettingGroup sgAdminList = settings.createGroup("Admin List");
 
     private final Setting<String> searchQuery = sgGeneral.add(new StringSetting.Builder()
         .name("search-query")
@@ -105,6 +107,12 @@ public class OrderSniperModule extends Module {
         .name("blacklisted-players")
         .description("Orders from these players will be skipped.")
         .defaultValue(List.of())
+        .build());
+
+    private final Setting<AdminListModule.Role> adminListRole = sgAdminList.add(new EnumSetting.Builder<AdminListModule.Role>()
+        .name("role")
+        .description("How to use the AdminList module: skip admin orders (Blacklist) or only accept admin orders (Whitelist).")
+        .defaultValue(AdminListModule.Role.OFF)
         .build());
 
     // ── Constructor ───────────────────────────────────────────────────────────
@@ -202,6 +210,7 @@ public class OrderSniperModule extends Module {
 
             String seller = extractPlayerName(stack);
             if (isBlacklisted(seller)) continue;
+            if (isFilteredByAdminList(seller)) continue;
 
             mc.interactionManager.clickSlot(h.syncId, slot.id, 0, SlotActionType.PICKUP, mc.player);
             if (notifications.get()) {
@@ -380,6 +389,22 @@ public class OrderSniperModule extends Module {
     private boolean isBlacklisted(String name) {
         if (name == null || blacklistedPlayers.get().isEmpty()) return false;
         return blacklistedPlayers.get().stream().anyMatch(b -> b.equalsIgnoreCase(name));
+    }
+
+    /**
+     * Returns true when this order should be skipped due to AdminList policy.
+     * <ul>
+     *   <li>BLACKLIST – skip orders from admin players.</li>
+     *   <li>WHITELIST – skip orders from non-admin players (only admins accepted).</li>
+     * </ul>
+     */
+    private boolean isFilteredByAdminList(String seller) {
+        AdminListModule.Role role = adminListRole.get();
+        if (role == AdminListModule.Role.OFF) return false;
+        AdminListModule al = Modules.get().get(AdminListModule.class);
+        if (al == null || !al.isActive()) return false;
+        boolean isAdmin = al.isAdmin(seller);
+        return role == AdminListModule.Role.BLACKLIST ? isAdmin : !isAdmin;
     }
 
     // Price patterns – precompiled to avoid per-call regex compilation
