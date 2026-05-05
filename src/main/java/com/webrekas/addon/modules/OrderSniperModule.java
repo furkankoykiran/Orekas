@@ -182,8 +182,9 @@ public class OrderSniperModule extends Module {
     }
 
     private void tickWaitGui(long now) {
-        // Require a minimum settling delay before reading the GUI
-        if (elapsed(now) < delayMs(Math.max(8, delayTicks.get()))) return;
+        // Minimum 4-tick settle (200 ms) is sufficient for most servers;
+        // extra delayTicks allows users to raise it for high-latency connections.
+        if (elapsed(now) < delayMs(Math.max(4, delayTicks.get()))) return;
 
         if (mc.currentScreen instanceof GenericContainerScreen screen) {
             ordersGUISyncId = screen.getScreenHandler().syncId;
@@ -248,9 +249,15 @@ public class OrderSniperModule extends Module {
     }
 
     /**
-     * Transfers one deliverable inventory slot per tick via QUICK_MOVE.
-     * Using one transfer per tick avoids flooding the server with packets
-     * and gives the server time to acknowledge each move before the next.
+     * Drains deliverable inventory slots into the deposit chest via QUICK_MOVE.
+     *
+     * Batch size is derived from delayTicks:
+     *   0  → 4 slots/tick  (≈full 36-slot inventory in ~9 ticks / 450 ms)
+     *   1  → 2 slots/tick
+     *   2+ → 1 slot/tick   (conservative, for high-latency connections)
+     *
+     * The chest-space check is re-evaluated before each individual transfer so
+     * we stop the moment the deposit side fills up rather than sending redundant packets.
      */
     private void tickDrain(long now) {
         if (!(mc.currentScreen instanceof GenericContainerScreen screen)) {
@@ -260,38 +267,38 @@ public class OrderSniperModule extends Module {
         ScreenHandler h = screen.getScreenHandler();
         PlayerInventory playerInv = mc.player.getInventory();
 
-        // Stop draining if the deposit chest side is full
-        boolean chestHasSpace = h.slots.stream()
-            .anyMatch(s -> s.inventory != playerInv && s.getStack().isEmpty());
-        if (!chestHasSpace) {
-            mc.player.closeHandledScreen();
-            advance(Stage.WAIT_CONFIRM);
-            return;
-        }
+        int delay = delayTicks.get();
+        int batchSize = delay == 0 ? 4 : delay == 1 ? 2 : 1;
 
-        // Skip non-deliverable slots
-        while (drainCursor < 36 && !isDeliverable(playerInv.getStack(drainCursor))) {
+        for (int i = 0; i < batchSize; i++) {
+            // Skip non-deliverable slots
+            while (drainCursor < 36 && !isDeliverable(playerInv.getStack(drainCursor))) {
+                drainCursor++;
+            }
+            if (drainCursor >= 36) {
+                mc.player.closeHandledScreen();
+                advance(Stage.WAIT_CONFIRM);
+                return;
+            }
+            // Re-check space before every individual transfer
+            boolean chestHasSpace = h.slots.stream()
+                .anyMatch(s -> s.inventory != playerInv && s.getStack().isEmpty());
+            if (!chestHasSpace) {
+                mc.player.closeHandledScreen();
+                advance(Stage.WAIT_CONFIRM);
+                return;
+            }
+            int guiSlotId = findGuiSlotId(h, playerInv, drainCursor);
+            if (guiSlotId >= 0) {
+                mc.interactionManager.clickSlot(
+                    h.syncId, guiSlotId, 0, SlotActionType.QUICK_MOVE, mc.player);
+            }
             drainCursor++;
         }
-
-        if (drainCursor >= 36) {
-            // Entire inventory scanned – close and confirm
-            mc.player.closeHandledScreen();
-            advance(Stage.WAIT_CONFIRM);
-            return;
-        }
-
-        // Transfer this slot and advance the cursor for next tick
-        int guiSlotId = findGuiSlotId(h, playerInv, drainCursor);
-        if (guiSlotId >= 0) {
-            mc.interactionManager.clickSlot(
-                h.syncId, guiSlotId, 0, SlotActionType.QUICK_MOVE, mc.player);
-        }
-        drainCursor++;
     }
 
     private void tickWaitConfirm(long now) {
-        if (elapsed(now) < delayMs(Math.max(8, delayTicks.get()))) return;
+        if (elapsed(now) < delayMs(Math.max(4, delayTicks.get()))) return;
 
         if (mc.currentScreen instanceof GenericContainerScreen) {
             advance(Stage.CONFIRM_SALE);
@@ -320,7 +327,7 @@ public class OrderSniperModule extends Module {
     }
 
     private void tickFinalize(long now) {
-        if (elapsed(now) < delayMs(Math.max(5, delayTicks.get()))) return;
+        if (elapsed(now) < delayMs(Math.max(3, delayTicks.get()))) return;
         if (mc.currentScreen != null) mc.player.closeHandledScreen();
 
         if (!hasDeliverableItems()) {
