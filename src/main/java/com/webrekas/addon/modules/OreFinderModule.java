@@ -34,41 +34,32 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
+import net.minecraft.world.chunk.ChunkSection;
 import net.minecraft.world.chunk.WorldChunk;
 import org.joml.Vector3d;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class OreFinderModule extends Module {
 
-    // ---- static tuning (was in settings, now fixed per user request) -------
+    // Phase 0 — explicit search state replaces the (inflight bool + volatile pos) pair
+    private enum SearchState { IDLE, SEARCHING }
 
-    private static final int CHUNK_RADIUS = 6;              // 13x13 chunks = 208x208 blocks
-    private static final int VEIN_SCAN_RADIUS = 8;          // max MC vein size in 1.21
-    private static final int EXPANSIONS_PER_TICK = 48;
-    private static final long FETCH_COOLDOWN_MS = 1_000;
-    private static final long AUTO_REFRESH_DISTANCE_SQ = 16L * 16L;
-    private static final boolean SHOW_LOW_CONFIDENCE = false;
-    private static final boolean AUTO_DETECT_SEED = true;
-
-    private static final ExecutorService WASM_EXECUTOR = Executors.newSingleThreadExecutor(new ThreadFactory() {
-        private final AtomicInteger n = new AtomicInteger();
-        @Override public Thread newThread(Runnable r) {
-            Thread t = new Thread(r, "orekas-wasm-" + n.getAndIncrement());
-            t.setDaemon(true);
-            return t;
-        }
+    private static final ExecutorService WASM_EXECUTOR = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "orekas-wasm-0");
+        t.setDaemon(true);
+        t.setPriority(Thread.NORM_PRIORITY - 1);
+        return t;
     });
     private static volatile OreFinderWasm sharedWasm;
 
@@ -78,7 +69,9 @@ public class OreFinderModule extends Module {
     private final SettingGroup sgOres     = this.settings.createGroup("Ores");
     private final SettingGroup sgRender   = this.settings.createGroup("Render");
     private final SettingGroup sgColors   = this.settings.createGroup("Colors");
+    private final SettingGroup sgAdvanced = this.settings.createGroup("Advanced");
 
+    // Input group
     private final Setting<String> worldSeed = sgInput.add(new StringSetting.Builder()
         .name("world-seed")
         .description("World seed (required on multiplayer; on single-player it's auto-detected).")
@@ -98,7 +91,7 @@ public class OreFinderModule extends Module {
         .onChanged(v -> { if (v) { triggerSearch(true); resetRefreshButton(); } })
         .build());
 
-    // Ores — in site order, Diamond ON by default
+    // Ores group — Diamond ON by default
     private final Setting<Boolean> oreDiamond       = oreToggle("diamond", true);
     private final Setting<Boolean> oreAncientDebris = oreToggle("ancient-debris", false);
     private final Setting<Boolean> oreGold          = oreToggle("gold", false);
@@ -115,6 +108,7 @@ public class OreFinderModule extends Module {
             .defaultValue(def).build());
     }
 
+    // Render group
     private final Setting<ShapeMode> shapeMode = sgRender.add(new EnumSetting.Builder<ShapeMode>()
         .name("shape-mode").description("How boxes are drawn.")
         .defaultValue(ShapeMode.Both).build());
@@ -126,7 +120,7 @@ public class OreFinderModule extends Module {
 
     private final Setting<Boolean> nametagForUnloaded = sgRender.add(new BoolSetting.Builder()
         .name("nametag-for-unloaded")
-        .description("For clusters whose chunks aren't loaded client-side, show a floating \"Nx Ore\" label instead of a fake box.")
+        .description("For clusters whose chunks aren't loaded client-side, show a floating \"Nx Ore\" label.")
         .defaultValue(true).build());
 
     private final Setting<Double> nametagScale = sgRender.add(new DoubleSetting.Builder()
@@ -134,6 +128,7 @@ public class OreFinderModule extends Module {
         .description("Size of the floating labels.")
         .defaultValue(1.0).range(0.3, 3.0).sliderRange(0.3, 3.0).build());
 
+    // Colors group — one SettingColor per ore type
     private final Map<OreType, Setting<SettingColor>> colorSettings = new EnumMap<>(OreType.class);
     {
         for (OreType t : OreType.values()) {
@@ -144,16 +139,69 @@ public class OreFinderModule extends Module {
         }
     }
 
+    // Advanced group — replaces the old static tuning constants (Phase 3)
+    // Defaults are identical to the old constants, so existing user configs are unaffected.
+    private final Setting<Integer> chunkRadius = sgAdvanced.add(new IntSetting.Builder()
+        .name("chunk-radius")
+        .description("Search radius in chunks (6 → 13×13 chunk area).")
+        .defaultValue(6).min(1).max(16).sliderRange(1, 12).build());
+
+    private final Setting<Integer> veinScanRadius = sgAdvanced.add(new IntSetting.Builder()
+        .name("vein-scan-radius")
+        .description("Block radius around each centroid scanned for real ore blocks.")
+        .defaultValue(8).min(1).max(16).sliderRange(1, 16).build());
+
+    private final Setting<Integer> expansionsPerTick = sgAdvanced.add(new IntSetting.Builder()
+        .name("expansions-per-tick")
+        .description("Max cluster scans per tick during the tick-budget expansion phase.")
+        .defaultValue(48).min(1).max(256).sliderRange(1, 128).build());
+
+    private final Setting<Integer> fetchCooldownMs = sgAdvanced.add(new IntSetting.Builder()
+        .name("fetch-cooldown-ms")
+        .description("Minimum milliseconds between WASM searches.")
+        .defaultValue(1000).min(100).max(30000).sliderRange(200, 10000).build());
+
+    private final Setting<Boolean> showLowConfidence = sgAdvanced.add(new BoolSetting.Builder()
+        .name("show-low-confidence")
+        .description("Render LOW-confidence WASM predictions.")
+        .defaultValue(false).build());
+
+    private final Setting<Integer> largeVeinThreshold = sgAdvanced.add(new IntSetting.Builder()
+        .name("large-vein-threshold")
+        .description("Skip centroid if >N same-type blocks found along X or Z axis in a 50-block window. Suppresses false positives in iron/coal bands.")
+        .defaultValue(50).min(10).max(200).sliderRange(10, 100).build());
+
     // ---- state -------------------------------------------------------------
 
-    private final Map<OreType, List<OreHit>> cache = new EnumMap<>(OreType.class);
-    private final AtomicBoolean inflight = new AtomicBoolean(false);
+    // Phase 1b — atomic snapshot: the render thread always reads a complete consistent map.
+    private final AtomicReference<Map<OreType, List<OreHit>>> cache =
+        new AtomicReference<>(emptyCache());
+
+    // Phase 2a — explicit state machine: replaces (AtomicBoolean inflight + volatile BlockPos)
+    private final AtomicReference<SearchState> searchState =
+        new AtomicReference<>(SearchState.IDLE);
     private final AtomicLong lastFetchMillis = new AtomicLong(0);
-    private volatile BlockPos lastFetchPos = null;
+    private final AtomicReference<BlockPos> lastFetchPos = new AtomicReference<>(null);
+
+    // Phase 2c — jitter rolled once per search completion, not per tick.
+    // ±20% of 16²=256: range [204, 307]. Prevents predictable re-fetch timing.
+    private final AtomicLong jitteredRefreshThreshold = new AtomicLong(256L);
+
+    private static Map<OreType, List<OreHit>> emptyCache() {
+        Map<OreType, List<OreHit>> m = new EnumMap<>(OreType.class);
+        for (OreType t : OreType.values()) m.put(t, List.of());
+        return Collections.unmodifiableMap(m);
+    }
 
     public OreFinderModule() {
-        super(OrekasAddon.CATEGORY, "ore-finder", "Per-block ore ESP using orefinder.gg's WASM in-process. Validates against live world state.");
-        for (OreType t : OreType.values()) cache.put(t, new CopyOnWriteArrayList<>());
+        super(OrekasAddon.CATEGORY, "ore-finder",
+            "Per-block ore ESP using orefinder.gg's WASM in-process. Validates against live world state.");
+    }
+
+    @Override
+    public String getInfoString() {
+        int total = cache.get().values().stream().mapToInt(List::size).sum();
+        return searchState.get().name().toLowerCase() + " | " + total + " clusters";
     }
 
     @Override
@@ -169,12 +217,8 @@ public class OreFinderModule extends Module {
 
     /**
      * Whether the module should be active in the current dimension + Y context.
-     * <ul>
-     *   <li>End: never runs.</li>
-     *   <li>Overworld + Y &gt;= 0: skipped — the anti-xray heuristic is only valid
-     *       below Y=0 on AntiXray-style servers (deepslate region masking).</li>
-     *   <li>Overworld below Y=0 / Nether: runs.</li>
-     * </ul>
+     * End: never. Overworld Y≥0: skipped (anti-xray heuristic only valid below Y=0).
+     * Overworld below Y=0 / Nether: active.
      */
     private boolean runsHere(ClientWorld world, PlayerEntity player) {
         if (world == null || player == null) return false;
@@ -186,7 +230,7 @@ public class OreFinderModule extends Module {
 
     @Override
     public void onDeactivate() {
-        for (List<OreHit> l : cache.values()) l.clear();
+        cache.set(emptyCache());
     }
 
     private void resetRefreshButton() {
@@ -197,6 +241,12 @@ public class OreFinderModule extends Module {
     // ---- search triggering -------------------------------------------------
 
     private void triggerSearch(boolean userInitiated) {
+        // Phase 2d — guard: executor cannot accept tasks if it was shut down externally.
+        if (WASM_EXECUTOR.isShutdown()) {
+            if (userInitiated) error("WASM executor is shut down — restart Minecraft.");
+            return;
+        }
+
         PlayerEntity player = mc.player;
         if (player == null) { if (userInitiated) warning("Not in a world."); return; }
         if (!runsHere(mc.world, player)) {
@@ -217,76 +267,80 @@ public class OreFinderModule extends Module {
         }
 
         long now = System.currentTimeMillis();
+        long cooldown = (long) fetchCooldownMs.get();
         long since = now - lastFetchMillis.get();
-        if (since < FETCH_COOLDOWN_MS) {
-            if (userInitiated) warning("Cooldown active. %d s remaining.", (FETCH_COOLDOWN_MS - since) / 1000 + 1);
+        if (since < cooldown) {
+            if (userInitiated) warning("Cooldown active. %d s remaining.", (cooldown - since) / 1000 + 1);
             return;
         }
-        if (!inflight.compareAndSet(false, true)) {
+
+        // Phase 2b — CAS on SearchState replaces the two-field implicit state.
+        if (!searchState.compareAndSet(SearchState.IDLE, SearchState.SEARCHING)) {
             if (userInitiated) info("A search is already running.");
             return;
         }
+
         BlockPos origin = player.getBlockPos();
-        lastFetchPos = origin;
+        lastFetchPos.set(origin);
         lastFetchMillis.set(now);
 
         OrePlatform plat = platform.get();
+        int radius = chunkRadius.get();  // capture before crossing thread boundary
 
         WASM_EXECUTOR.submit(() -> {
             try {
                 OreFinderWasm wasm = sharedWasm();
+                // Phase 1c — build full snapshot in WASM thread; never touch the live cache.
+                Map<OreType, List<OreHit>> next = new EnumMap<>(OreType.class);
+                for (OreType t : OreType.values()) next.put(t, List.of());
                 int total = 0;
                 for (OreType t : enabled) {
                     try {
                         List<OreHit> hits = wasm.findOres(seed, plat, t,
-                            origin.getX(), origin.getZ(), CHUNK_RADIUS);
-                        List<OreHit> cached = cache.get(t);
-                        cached.clear();
-                        cached.addAll(hits);
+                            origin.getX(), origin.getZ(), radius);
+                        next.put(t, Collections.unmodifiableList(new ArrayList<>(hits)));
                         total += hits.size();
                     } catch (Throwable perOreEx) {
                         OrekasAddon.LOG.error("[Orekas] search failed for " + t, perOreEx);
                         error("search failed for %s: %s", t.label(), perOreEx.getClass().getSimpleName());
                     }
                 }
-                for (OreType t : OreType.values()) {
-                    if (!enabled.contains(t)) cache.get(t).clear();
-                }
+                // Single atomic swap — render thread always sees a complete consistent map.
+                cache.set(Collections.unmodifiableMap(next));
                 info("cached %d clusters across %d ore type(s).", total, enabled.size());
             } catch (Throwable ex) {
                 OrekasAddon.LOG.error("[Orekas] WASM search failed", ex);
                 error("search failed: %s: %s", ex.getClass().getSimpleName(), String.valueOf(ex.getMessage()));
             } finally {
-                inflight.set(false);
+                searchState.set(SearchState.IDLE);
+                // Phase 2c — re-roll jitter once per search, not per tick.
+                jitteredRefreshThreshold.set(
+                    (long)(256.0 * (0.8 + ThreadLocalRandom.current().nextDouble(0.4))));
             }
         });
     }
 
     private List<OreType> enabledOres() {
-        // Ancient Debris only generates in the Nether — never search for it in the
-        // Overworld even if the user toggle is on. Called from triggerSearch on the
-        // tick thread, so mc.world access is safe.
+        // Ancient Debris only generates in the Nether.
         boolean overworld = PlayerUtils.getDimension() == Dimension.Overworld;
         List<OreType> out = new ArrayList<>();
-        if (oreDiamond.get())                    out.add(OreType.DIAMOND);
+        if (oreDiamond.get())                     out.add(OreType.DIAMOND);
         if (oreAncientDebris.get() && !overworld) out.add(OreType.ANCIENT_DEBRIS);
-        if (oreGold.get())                       out.add(OreType.GOLD);
-        if (oreIron.get())                       out.add(OreType.IRON);
-        if (oreCopper.get())                     out.add(OreType.COPPER);
-        if (oreEmerald.get())                    out.add(OreType.EMERALD);
-        if (oreRedstone.get())                   out.add(OreType.REDSTONE);
-        if (oreLapis.get())                      out.add(OreType.LAPIS);
-        if (oreCoal.get())                       out.add(OreType.COAL);
+        if (oreGold.get())                        out.add(OreType.GOLD);
+        if (oreIron.get())                        out.add(OreType.IRON);
+        if (oreCopper.get())                      out.add(OreType.COPPER);
+        if (oreEmerald.get())                     out.add(OreType.EMERALD);
+        if (oreRedstone.get())                    out.add(OreType.REDSTONE);
+        if (oreLapis.get())                       out.add(OreType.LAPIS);
+        if (oreCoal.get())                        out.add(OreType.COAL);
         return out;
     }
 
     private Long resolveSeed() {
-        if (AUTO_DETECT_SEED) {
-            MinecraftServer server = mc.getServer();
-            if (server != null) {
-                ServerWorld overworld = server.getOverworld();
-                if (overworld != null) return overworld.getSeed();
-            }
+        MinecraftServer server = mc.getServer();
+        if (server != null) {
+            ServerWorld overworld = server.getOverworld();
+            if (overworld != null) return overworld.getSeed();
         }
         String raw = worldSeed.get();
         if (raw == null || raw.isBlank()) return null;
@@ -311,33 +365,32 @@ public class OreFinderModule extends Module {
     // ---- chunk-load expansion ---------------------------------------------
 
     /**
-     * When a chunk lands, immediately expand any pending centroids that fall
-     * inside it (or its 8 neighbors, since the vein scan radius can spill across
-     * a chunk boundary). This sidesteps the per-tick budget for the common
-     * "I just walked into render distance" case — ESP appears as soon as the
-     * data is available, not on the next expansion-budget cycle.
+     * When a chunk lands, immediately expand any pending centroids whose vein scan
+     * window overlaps the newly loaded chunk. Defers until all neighbour chunks are
+     * loaded to prevent partial scans being permanently locked by the CAS.
      */
     @EventHandler
     private void onChunkData(ChunkDataEvent event) {
         ClientWorld world = mc.world;
         if (!runsHere(world, mc.player)) return;
-        WorldChunk chunk = event.chunk();
-        int cx = chunk.getPos().x;
-        int cz = chunk.getPos().z;
+        int cx = event.chunk().getPos().x;
+        int cz = event.chunk().getPos().z;
 
         for (OreType t : OreType.values()) {
             Set<Block> targets = t.targetBlocks();
-            for (OreHit h : cache.get(t)) {
+            // Phase 1d — read from the atomic snapshot.
+            for (OreHit h : cache.get().get(t)) {
                 if (h.scanAttempted()) continue;
                 BlockPos c = h.pos();
                 int hcx = c.getX() >> 4;
                 int hcz = c.getZ() >> 4;
-                // Only consider centroids whose 3x3 chunk window includes this chunk.
                 if (Math.abs(hcx - cx) > 1 || Math.abs(hcz - cz) > 1) continue;
-                // Defer until every chunk the scan needs is loaded; partial scans
-                // would mark the cluster done with missing blocks.
                 if (!allNeighborsLoaded(world, c)) continue;
-                if (!SHOW_LOW_CONFIDENCE && h.isLowConfidence()) {
+                if (!showLowConfidence.get() && h.isLowConfidence()) {
+                    h.setExpandedBlocks(List.of());
+                    continue;
+                }
+                if (isLargeVeinFalsePositive(world, c, targets)) {
                     h.setExpandedBlocks(List.of());
                     continue;
                 }
@@ -346,14 +399,14 @@ public class OreFinderModule extends Module {
         }
     }
 
-    private static boolean allNeighborsLoaded(ClientWorld world, BlockPos c) {
-        int x0 = (c.getX() - VEIN_SCAN_RADIUS) >> 4, x1 = (c.getX() + VEIN_SCAN_RADIUS) >> 4;
-        int z0 = (c.getZ() - VEIN_SCAN_RADIUS) >> 4, z1 = (c.getZ() + VEIN_SCAN_RADIUS) >> 4;
-        for (int x = x0; x <= x1; x++) {
-            for (int z = z0; z <= z1; z++) {
+    // Phase 3d — allNeighborsLoaded now uses the configurable veinScanRadius setting.
+    private boolean allNeighborsLoaded(ClientWorld world, BlockPos c) {
+        int r = veinScanRadius.get();
+        int x0 = (c.getX() - r) >> 4, x1 = (c.getX() + r) >> 4;
+        int z0 = (c.getZ() - r) >> 4, z1 = (c.getZ() + r) >> 4;
+        for (int x = x0; x <= x1; x++)
+            for (int z = z0; z <= z1; z++)
                 if (!world.isChunkLoaded(x, z)) return false;
-            }
-        }
         return true;
     }
 
@@ -365,46 +418,84 @@ public class OreFinderModule extends Module {
         if (world == null) return;
         if (!runsHere(world, mc.player)) return;
 
-        // Auto-refresh on significant movement
+        // Phase 2c — single atomic read; jitter stored in AtomicLong, not re-rolled here.
+        BlockPos prevPos = lastFetchPos.get();
         PlayerEntity player = mc.player;
-        if (player != null && lastFetchPos != null) {
+        if (player != null && prevPos != null) {
             BlockPos p = player.getBlockPos();
-            long dx = p.getX() - lastFetchPos.getX();
-            long dz = p.getZ() - lastFetchPos.getZ();
-            if (dx * dx + dz * dz > AUTO_REFRESH_DISTANCE_SQ) triggerSearch(false);
+            long dx = p.getX() - prevPos.getX();
+            long dz = p.getZ() - prevPos.getZ();
+            if (dx * dx + dz * dz > jitteredRefreshThreshold.get()) triggerSearch(false);
         }
 
-        // Expand up to EXPANSIONS_PER_TICK pending clusters whose chunks are loaded.
-        int budget = EXPANSIONS_PER_TICK;
+        // Phase 4c — use allNeighborsLoaded (not just centroid chunk) to prevent
+        // permanently locking a partial scan result via the CAS in setExpandedBlocks.
+        int budget = expansionsPerTick.get();
         for (OreType t : OreType.values()) {
             if (budget <= 0) break;
             Set<Block> targets = t.targetBlocks();
-            for (OreHit h : cache.get(t)) {
+            // Phase 1d — read from the atomic snapshot.
+            for (OreHit h : cache.get().get(t)) {
                 if (budget <= 0) break;
                 if (h.scanAttempted()) continue;
-                if (!SHOW_LOW_CONFIDENCE && h.isLowConfidence()) { h.setExpandedBlocks(List.of()); continue; }
+                if (!showLowConfidence.get() && h.isLowConfidence()) {
+                    h.setExpandedBlocks(List.of());
+                    continue;
+                }
                 BlockPos c = h.pos();
-                if (!world.isChunkLoaded(c.getX() >> 4, c.getZ() >> 4)) continue;
+                if (!allNeighborsLoaded(world, c)) continue;
+                if (isLargeVeinFalsePositive(world, c, targets)) {
+                    h.setExpandedBlocks(List.of());
+                    continue;
+                }
                 h.setExpandedBlocks(scanCluster(world, c, targets));
                 budget--;
             }
         }
     }
 
-    private static List<BlockPos> scanCluster(ClientWorld world, BlockPos center, Set<Block> targets) {
+    // Phase 4a — section-based cluster scan.
+    // Iterates ChunkSection[] directly instead of the 17³ per-block world.getBlockState() loop.
+    // Eliminates the per-block chunk+section lookup chain; cost is O(sections × 16³) with
+    // much cheaper inner-loop block access.
+    private List<BlockPos> scanCluster(ClientWorld world, BlockPos center, Set<Block> targets) {
+        int radius = veinScanRadius.get();
         List<BlockPos> found = new ArrayList<>();
-        BlockPos.Mutable probe = new BlockPos.Mutable();
-        int cx = center.getX();
-        int cy = center.getY();
-        int cz = center.getZ();
-        for (int dx = -VEIN_SCAN_RADIUS; dx <= VEIN_SCAN_RADIUS; dx++) {
-            for (int dy = -VEIN_SCAN_RADIUS; dy <= VEIN_SCAN_RADIUS; dy++) {
-                for (int dz = -VEIN_SCAN_RADIUS; dz <= VEIN_SCAN_RADIUS; dz++) {
-                    int x = cx + dx, y = cy + dy, z = cz + dz;
-                    if (!world.isChunkLoaded(x >> 4, z >> 4)) continue;
-                    probe.set(x, y, z);
-                    if (targets.contains(world.getBlockState(probe).getBlock())) {
-                        found.add(probe.toImmutable());
+        int cx = center.getX(), cy = center.getY(), cz = center.getZ();
+        int chunkX0 = (cx - radius) >> 4, chunkX1 = (cx + radius) >> 4;
+        int chunkZ0 = (cz - radius) >> 4, chunkZ1 = (cz + radius) >> 4;
+
+        for (int chx = chunkX0; chx <= chunkX1; chx++) {
+            for (int chz = chunkZ0; chz <= chunkZ1; chz++) {
+                if (!world.isChunkLoaded(chx, chz)) continue;
+                WorldChunk chunk = world.getChunk(chx, chz);
+                ChunkSection[] sections = chunk.getSectionArray();
+                int baseY = chunk.getBottomY();
+                int worldXBase = chx << 4, worldZBase = chz << 4;
+
+                for (int si = 0; si < sections.length; si++) {
+                    ChunkSection section = sections[si];
+                    if (section == null || section.isEmpty()) continue;
+                    int sectionBaseY = baseY + si * 16;
+
+                    // Compute local-Y bounds where the scan window overlaps this section.
+                    int yMinRaw = cy - radius - sectionBaseY;
+                    int yMaxRaw = cy + radius - sectionBaseY;
+                    if (yMaxRaw < 0 || yMinRaw > 15) continue;
+                    int yMin = Math.max(0, yMinRaw);
+                    int yMax = Math.min(15, yMaxRaw);
+
+                    for (int lx = 0; lx < 16; lx++) {
+                        int worldX = worldXBase + lx;
+                        if (worldX < cx - radius || worldX > cx + radius) continue;
+                        for (int lz = 0; lz < 16; lz++) {
+                            int worldZ = worldZBase + lz;
+                            if (worldZ < cz - radius || worldZ > cz + radius) continue;
+                            for (int ly = yMin; ly <= yMax; ly++) {
+                                if (targets.contains(section.getBlockState(lx, ly, lz).getBlock()))
+                                    found.add(new BlockPos(worldX, sectionBaseY + ly, worldZ));
+                            }
+                        }
                     }
                 }
             }
@@ -412,23 +503,51 @@ public class OreFinderModule extends Module {
         return found;
     }
 
+    // Phase 4b — large-vein false-positive filter.
+    // Scans ±25 blocks along X and Z axes. If >threshold same-type blocks are found along
+    // either axis, the centroid is likely sitting in a natural band (iron/coal layer) rather
+    // than a localized vein, and should be suppressed.
+    //
+    // Y-axis intentionally omitted: deepslate bands extend horizontally, not vertically.
+    // In anti-xray environments the buried ores are replaced with stone, so the Y scan
+    // would see only stone and would never fire — 51 wasted getBlockState() calls per tick.
+    private boolean isLargeVeinFalsePositive(ClientWorld world, BlockPos center, Set<Block> targets) {
+        final int HALF = 25;
+        int threshold = largeVeinThreshold.get();
+        int cx = center.getX(), cy = center.getY(), cz = center.getZ();
+        int worldMinY = world.getBottomY(), worldMaxY = world.getBottomY() + world.getHeight() - 1;
+        BlockPos.Mutable probe = new BlockPos.Mutable();
+
+        // Clamp Y to world bounds to avoid probing outside the loaded world height.
+        int clampedY = Math.max(worldMinY, Math.min(worldMaxY, cy));
+
+        int xCount = 0;
+        for (int dx = -HALF; dx <= HALF; dx++) {
+            probe.set(cx + dx, clampedY, cz);
+            if (!world.isChunkLoaded(probe.getX() >> 4, probe.getZ() >> 4)) continue;
+            if (targets.contains(world.getBlockState(probe).getBlock()) && ++xCount > threshold)
+                return true;
+        }
+        int zCount = 0;
+        for (int dz = -HALF; dz <= HALF; dz++) {
+            probe.set(cx, clampedY, cz + dz);
+            if (!world.isChunkLoaded(probe.getX() >> 4, probe.getZ() >> 4)) continue;
+            if (targets.contains(world.getBlockState(probe).getBlock()) && ++zCount > threshold)
+                return true;
+        }
+        return false;
+    }
+
     /**
      * Should the WASM-predicted centroid be drawn as a "trust the prediction" box?
-     *
-     * <p>The rule mirrors Paper's anti-xray engine-mode-2 logic: that engine only
-     * replaces ores with stone when all six face-neighbors are opaque full cubes.
-     * So if the centroid block isn't a target ore but is fully buried in opaque
-     * blocks, the server is likely hiding a real ore there and we should trust
-     * the WASM. If the centroid has any non-opaque neighbor (air, glass, water,
-     * leaves, slab), the server would have shipped the real ore — the fact that
-     * we see a non-ore block means it's mined or WASM was wrong.
+     * Mirrors Paper anti-xray engine-mode-2: ores are hidden only when all six face-neighbours
+     * are opaque. If the centroid block is fully buried in opaque blocks, the server is hiding
+     * a real ore there and we trust the WASM prediction.
      */
     private static boolean shouldShowCentroidPrediction(
             ClientWorld world, BlockPos c, Set<Block> targets) {
         BlockState self = world.getBlockState(c);
-        // Centroid already rendered as a real block in the per-block ESP loop.
         if (targets.contains(self.getBlock())) return false;
-        // Non-opaque at centroid (air / glass / water / leaves) ⇒ we see it's not ore.
         if (!self.isOpaque()) return false;
         for (Direction dir : Direction.values()) {
             BlockPos n = c.offset(dir);
@@ -448,28 +567,25 @@ public class OreFinderModule extends Module {
 
         int alpha = fillAlpha.get();
         ShapeMode mode = shapeMode.get();
+        boolean showLow = showLowConfidence.get();
 
         for (OreType t : OreType.values()) {
-            List<OreHit> hits = cache.get(t);
+            // Phase 1d — read from the atomic snapshot.
+            List<OreHit> hits = cache.get().get(t);
             if (hits.isEmpty()) continue;
             SettingColor line = colorSettings.get(t).get();
             Color side = new Color(line.r, line.g, line.b, alpha);
             Set<Block> targets = t.targetBlocks();
 
             for (OreHit h : hits) {
-                if (!SHOW_LOW_CONFIDENCE && h.isLowConfidence()) continue;
+                if (!showLow && h.isLowConfidence()) continue;
                 BlockPos centroid = h.pos();
-
-                // Chunk unloaded → skip 3D rendering; Render2DEvent handles the nametag.
                 if (!world.isChunkLoaded(centroid.getX() >> 4, centroid.getZ() >> 4)) continue;
 
-                // Per-block ESP for real target blocks we've scanned and validated.
-                // Captures: vanilla worlds (full vein visible) + exposed portions of
-                // clusters on anti-xray servers (server sends real block for exposed ores).
                 List<BlockPos> expanded = h.expandedBlocks();
                 if (expanded != null && !expanded.isEmpty()) {
                     for (BlockPos p : expanded) {
-                        if (!targets.contains(world.getBlockState(p).getBlock())) continue; // mined → skip
+                        if (!targets.contains(world.getBlockState(p).getBlock())) continue;
                         event.renderer.box(
                             p.getX(), p.getY(), p.getZ(),
                             p.getX() + 1.0, p.getY() + 1.0, p.getZ() + 1.0,
@@ -477,13 +593,6 @@ public class OreFinderModule extends Module {
                     }
                 }
 
-                // Anti-xray bypass / WASM prediction overlay: only kick in when the scan
-                // actually ran and found *no* real target blocks in the vein vicinity.
-                // On vanilla worlds this skips the overlay entirely (the vein's real
-                // blocks already render via block ESP), preventing the "extra box on a
-                // stone block near the centroid" false positive. On anti-xray servers,
-                // fully-buried clusters where the server sent stone everywhere still
-                // render the predicted centroid.
                 if (h.scanAttempted()
                     && expanded != null && expanded.isEmpty()
                     && shouldShowCentroidPrediction(world, centroid, targets)) {
@@ -506,18 +615,18 @@ public class OreFinderModule extends Module {
         TextRenderer text = TextRenderer.get();
         double scale = nametagScale.get();
 
-        // We need begin/end scoping. Iterate eligible hits and render each nametag.
         for (OreType t : OreType.values()) {
-            List<OreHit> hits = cache.get(t);
+            // Phase 1d — read from the atomic snapshot.
+            List<OreHit> hits = cache.get().get(t);
             if (hits.isEmpty()) continue;
             SettingColor lineColor = colorSettings.get(t).get();
             Color tagColor = new Color(lineColor.r, lineColor.g, lineColor.b, 255);
 
             for (OreHit h : hits) {
-                if (h.scanAttempted()) continue; // chunk was loaded and scan ran; not eligible for nametag
-                if (!SHOW_LOW_CONFIDENCE && h.isLowConfidence()) continue;
+                if (h.scanAttempted()) continue;
+                if (!showLowConfidence.get() && h.isLowConfidence()) continue;
                 BlockPos c = h.pos();
-                if (world.isChunkLoaded(c.getX() >> 4, c.getZ() >> 4)) continue; // chunk loaded, just waiting for next tick
+                if (world.isChunkLoaded(c.getX() >> 4, c.getZ() >> 4)) continue;
 
                 Vector3d pos = new Vector3d(c.getX() + 0.5, c.getY() + 0.5, c.getZ() + 0.5);
                 if (!NametagUtils.to2D(pos, scale)) continue;
