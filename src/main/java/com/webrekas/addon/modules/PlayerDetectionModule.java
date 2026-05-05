@@ -4,6 +4,7 @@ import com.webrekas.addon.OrekasAddon;
 import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.settings.*;
 import meteordevelopment.meteorclient.systems.modules.Module;
+import meteordevelopment.meteorclient.systems.modules.Modules;
 import meteordevelopment.meteorclient.utils.player.ChatUtils;
 import meteordevelopment.meteorclient.utils.render.MeteorToast;
 import meteordevelopment.orbit.EventHandler;
@@ -44,10 +45,11 @@ public class PlayerDetectionModule extends Module {
 
     // ── Settings ──────────────────────────────────────────────────────────────
 
-    private final SettingGroup sgGeneral = settings.getDefaultGroup();
-    private final SettingGroup sgAlert   = settings.createGroup("Alert");
-    private final SettingGroup sgActions = settings.createGroup("Actions");
-    private final SettingGroup sgWebhook = settings.createGroup("Webhook");
+    private final SettingGroup sgGeneral   = settings.getDefaultGroup();
+    private final SettingGroup sgAlert     = settings.createGroup("Alert");
+    private final SettingGroup sgActions   = settings.createGroup("Actions");
+    private final SettingGroup sgAdminList = settings.createGroup("Admin List");
+    private final SettingGroup sgWebhook   = settings.createGroup("Webhook");
 
     private final Setting<List<String>> whitelist = sgGeneral.add(new StringListSetting.Builder()
         .name("whitelist")
@@ -83,6 +85,12 @@ public class PlayerDetectionModule extends Module {
         .name("disconnect")
         .description("Disconnect from the server when a player is detected.")
         .defaultValue(true)
+        .build());
+
+    private final Setting<AdminListModule.Role> adminListRole = sgAdminList.add(new EnumSetting.Builder<AdminListModule.Role>()
+        .name("role")
+        .description("Whitelist: treat admin players as safe (no alert). Blacklist: always alert for admins, overriding personal whitelist.")
+        .defaultValue(AdminListModule.Role.OFF)
         .build());
 
     private final Setting<Boolean> enableWebhook = sgWebhook.add(new BoolSetting.Builder()
@@ -145,6 +153,19 @@ public class PlayerDetectionModule extends Module {
         // Build the full ignore set
         Set<String> ignoreSet = new HashSet<>(PERMANENT_WHITELIST);
         whitelist.get().forEach(n -> ignoreSet.add(n.toLowerCase(Locale.ROOT)));
+
+        // Apply AdminList policy
+        AdminListModule al = Modules.get().get(AdminListModule.class);
+        if (al != null && al.isActive()) {
+            AdminListModule.Role role = adminListRole.get();
+            if (role == AdminListModule.Role.WHITELIST) {
+                // Admins are trusted – add to ignore set so no alert fires
+                al.admins.get().forEach(n -> ignoreSet.add(n.toLowerCase(Locale.ROOT)));
+            } else if (role == AdminListModule.Role.BLACKLIST) {
+                // Admins override personal whitelist – remove from ignore set so they always trigger
+                al.admins.get().forEach(n -> ignoreSet.remove(n.toLowerCase(Locale.ROOT)));
+            }
+        }
 
         // Collect currently visible non-ignored players
         Set<String> current = new HashSet<>();

@@ -1,6 +1,7 @@
 package com.webrekas.addon;
 
 import com.mojang.logging.LogUtils;
+import com.webrekas.addon.modules.AdminListModule;
 import com.webrekas.addon.modules.AutoSellModule;
 import com.webrekas.addon.modules.OreFinderModule;
 import com.webrekas.addon.modules.OrderSniperModule;
@@ -20,6 +21,8 @@ public class OrekasAddon extends MeteorAddon {
         LOG.info("Initializing Orekas Addon");
 
         Modules.get().add(new OreFinderModule());
+        // AdminList must be registered before any module that consults it
+        Modules.get().add(new AdminListModule());
         Modules.get().add(new OrderSniperModule());
         Modules.get().add(new AutoSellModule());
         Modules.get().add(new PlayerDetectionModule());
