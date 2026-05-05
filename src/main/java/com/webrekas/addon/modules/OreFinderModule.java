@@ -154,7 +154,7 @@ public class OreFinderModule extends Module {
     private final Setting<Integer> expansionsPerTick = sgAdvanced.add(new IntSetting.Builder()
         .name("expansions-per-tick")
         .description("Max cluster scans per tick during the tick-budget expansion phase.")
-        .defaultValue(48).min(1).max(256).sliderRange(1, 128).build());
+        .defaultValue(128).min(1).max(512).sliderRange(1, 256).build());
 
     private final Setting<Integer> fetchCooldownMs = sgAdvanced.add(new IntSetting.Builder()
         .name("fetch-cooldown-ms")
@@ -428,42 +428,61 @@ public class OreFinderModule extends Module {
             if (dx * dx + dz * dz > jitteredRefreshThreshold.get()) triggerSearch(false);
         }
 
-        // Phase 4c — use allNeighborsLoaded (not just centroid chunk) to prevent
-        // permanently locking a partial scan result via the CAS in setExpandedBlocks.
-        int budget = expansionsPerTick.get();
+        // Phase 4c — tick-budget expansion sweep.
+        // Skip the entire loop when every cluster has already been scanned — the common
+        // steady-state case where the player is not moving and all chunks are loaded.
+        Map<OreType, List<OreHit>> snapshot = cache.get();
+        boolean anyPending = false;
+        outer:
         for (OreType t : OreType.values()) {
-            if (budget <= 0) break;
-            Set<Block> targets = t.targetBlocks();
-            // Phase 1d — read from the atomic snapshot.
-            for (OreHit h : cache.get().get(t)) {
+            for (OreHit h : snapshot.get(t)) {
+                if (!h.scanAttempted()) { anyPending = true; break outer; }
+            }
+        }
+
+        if (anyPending) {
+            int budget = expansionsPerTick.get();
+            boolean showLow = showLowConfidence.get();
+            for (OreType t : OreType.values()) {
                 if (budget <= 0) break;
-                if (h.scanAttempted()) continue;
-                if (!showLowConfidence.get() && h.isLowConfidence()) {
-                    h.setExpandedBlocks(List.of());
-                    continue;
+                Set<Block> targets = t.targetBlocks();
+                for (OreHit h : snapshot.get(t)) {
+                    if (budget <= 0) break;
+                    if (h.scanAttempted()) continue;
+                    if (!showLow && h.isLowConfidence()) {
+                        h.setExpandedBlocks(List.of());
+                        continue;
+                    }
+                    BlockPos c = h.pos();
+                    if (!allNeighborsLoaded(world, c)) continue;
+                    if (isLargeVeinFalsePositive(world, c, targets)) {
+                        h.setExpandedBlocks(List.of());
+                        continue;
+                    }
+                    h.setExpandedBlocks(scanCluster(world, c, targets));
+                    budget--;
                 }
-                BlockPos c = h.pos();
-                if (!allNeighborsLoaded(world, c)) continue;
-                if (isLargeVeinFalsePositive(world, c, targets)) {
-                    h.setExpandedBlocks(List.of());
-                    continue;
-                }
-                h.setExpandedBlocks(scanCluster(world, c, targets));
-                budget--;
             }
         }
     }
 
-    // Phase 4a — section-based cluster scan.
-    // Iterates ChunkSection[] directly instead of the 17³ per-block world.getBlockState() loop.
-    // Eliminates the per-block chunk+section lookup chain; cost is O(sections × 16³) with
-    // much cheaper inner-loop block access.
+    /**
+     * Section-based cluster scan.
+     *
+     * Iterates ChunkSection[] directly rather than calling world.getBlockState() per block.
+     * The inner X/Z bounds are pre-computed per chunk so the hot loop contains no conditional
+     * branches — it only iterates columns that are within the scan radius.
+     * Cost: O(sections_in_window × lx_cols × lz_cols × y_rows), all integer arithmetic
+     * with palette array reads in the innermost position.
+     */
     private List<BlockPos> scanCluster(ClientWorld world, BlockPos center, Set<Block> targets) {
         int radius = veinScanRadius.get();
         List<BlockPos> found = new ArrayList<>();
         int cx = center.getX(), cy = center.getY(), cz = center.getZ();
         int chunkX0 = (cx - radius) >> 4, chunkX1 = (cx + radius) >> 4;
         int chunkZ0 = (cz - radius) >> 4, chunkZ1 = (cz + radius) >> 4;
+        int worldXMin = cx - radius, worldXMax = cx + radius;
+        int worldZMin = cz - radius, worldZMax = cz + radius;
 
         for (int chx = chunkX0; chx <= chunkX1; chx++) {
             for (int chz = chunkZ0; chz <= chunkZ1; chz++) {
@@ -473,24 +492,26 @@ public class OreFinderModule extends Module {
                 int baseY = chunk.getBottomY();
                 int worldXBase = chx << 4, worldZBase = chz << 4;
 
+                // Pre-compute column bounds for this chunk to eliminate per-block conditionals
+                int lxMin = Math.max(0,  worldXMin - worldXBase);
+                int lxMax = Math.min(15, worldXMax - worldXBase);
+                int lzMin = Math.max(0,  worldZMin - worldZBase);
+                int lzMax = Math.min(15, worldZMax - worldZBase);
+
                 for (int si = 0; si < sections.length; si++) {
                     ChunkSection section = sections[si];
                     if (section == null || section.isEmpty()) continue;
                     int sectionBaseY = baseY + si * 16;
 
-                    // Compute local-Y bounds where the scan window overlaps this section.
-                    int yMinRaw = cy - radius - sectionBaseY;
-                    int yMaxRaw = cy + radius - sectionBaseY;
-                    if (yMaxRaw < 0 || yMinRaw > 15) continue;
-                    int yMin = Math.max(0, yMinRaw);
-                    int yMax = Math.min(15, yMaxRaw);
+                    // Clamp Y scan to where the search window overlaps this section
+                    int yMin = Math.max(0,  cy - radius - sectionBaseY);
+                    int yMax = Math.min(15, cy + radius - sectionBaseY);
+                    if (yMax < 0 || yMin > 15) continue;
 
-                    for (int lx = 0; lx < 16; lx++) {
+                    for (int lx = lxMin; lx <= lxMax; lx++) {
                         int worldX = worldXBase + lx;
-                        if (worldX < cx - radius || worldX > cx + radius) continue;
-                        for (int lz = 0; lz < 16; lz++) {
+                        for (int lz = lzMin; lz <= lzMax; lz++) {
                             int worldZ = worldZBase + lz;
-                            if (worldZ < cz - radius || worldZ > cz + radius) continue;
                             for (int ly = yMin; ly <= yMax; ly++) {
                                 if (targets.contains(section.getBlockState(lx, ly, lz).getBlock()))
                                     found.add(new BlockPos(worldX, sectionBaseY + ly, worldZ));
