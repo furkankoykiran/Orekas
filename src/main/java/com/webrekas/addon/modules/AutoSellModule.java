@@ -64,6 +64,12 @@ public class AutoSellModule extends Module {
         .defaultValue(true)
         .build());
 
+    private final Setting<Boolean> debug = sgGeneral.add(new BoolSetting.Builder()
+        .name("debug")
+        .description("Log detailed state and slot decisions to chat.")
+        .defaultValue(false)
+        .build());
+
     // ── Constructor ───────────────────────────────────────────────────────────
 
     public AutoSellModule() {

@@ -57,6 +57,12 @@ public class PlayerDetectionModule extends Module {
         .defaultValue(new ArrayList<>())
         .build());
 
+    private final Setting<Boolean> debug = sgGeneral.add(new BoolSetting.Builder()
+        .name("debug")
+        .description("Log player arrivals/departures and trigger decisions to chat.")
+        .defaultValue(false)
+        .build());
+
     private final Setting<AlertMode> alertMode = sgAlert.add(new EnumSetting.Builder<AlertMode>()
         .name("alert-mode")
         .description("How to notify when a player is detected.")

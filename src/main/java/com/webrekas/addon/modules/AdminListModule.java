@@ -1,9 +1,7 @@
 package com.webrekas.addon.modules;
 
 import com.webrekas.addon.OrekasAddon;
-import meteordevelopment.meteorclient.settings.Setting;
-import meteordevelopment.meteorclient.settings.SettingGroup;
-import meteordevelopment.meteorclient.settings.StringListSetting;
+import meteordevelopment.meteorclient.settings.*;
 import meteordevelopment.meteorclient.systems.modules.Module;
 
 import java.util.List;
@@ -31,6 +29,12 @@ public class AdminListModule extends Module {
         .defaultValue(List.of())
         .build());
 
+    private final Setting<Boolean> debug = sgGeneral.add(new BoolSetting.Builder()
+        .name("debug")
+        .description("Log isAdmin() lookups to chat (useful when troubleshooting role filtering in other modules).")
+        .defaultValue(false)
+        .build());
+
     public AdminListModule() {
         super(OrekasAddon.CATEGORY, "admin-list",
             "Named player list shared with other modules as a blacklist or whitelist.");
@@ -43,7 +47,9 @@ public class AdminListModule extends Module {
      */
     public boolean isAdmin(String name) {
         if (!isActive() || name == null) return false;
-        return admins.get().stream().anyMatch(a -> a.equalsIgnoreCase(name));
+        boolean result = admins.get().stream().anyMatch(a -> a.equalsIgnoreCase(name));
+        if (debug.get()) info("[dbg] isAdmin(%s) = %b", name, result);
+        return result;
     }
 
     /**
