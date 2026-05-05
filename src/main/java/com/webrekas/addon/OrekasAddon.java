@@ -1,7 +1,10 @@
 package com.webrekas.addon;
 
 import com.mojang.logging.LogUtils;
+import com.webrekas.addon.modules.AutoSellModule;
 import com.webrekas.addon.modules.OreFinderModule;
+import com.webrekas.addon.modules.OrderSniperModule;
+import com.webrekas.addon.modules.PlayerDetectionModule;
 import meteordevelopment.meteorclient.addons.GithubRepo;
 import meteordevelopment.meteorclient.addons.MeteorAddon;
 import meteordevelopment.meteorclient.systems.modules.Category;
@@ -17,6 +20,9 @@ public class OrekasAddon extends MeteorAddon {
         LOG.info("Initializing Orekas Addon");
 
         Modules.get().add(new OreFinderModule());
+        Modules.get().add(new OrderSniperModule());
+        Modules.get().add(new AutoSellModule());
+        Modules.get().add(new PlayerDetectionModule());
     }
 
     @Override
