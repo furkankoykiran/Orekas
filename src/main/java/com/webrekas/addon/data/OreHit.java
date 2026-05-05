@@ -3,12 +3,8 @@ package com.webrekas.addon.data;
 import net.minecraft.util.math.BlockPos;
 
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 
-/**
- * One ore cluster returned by the WASM. Holds the centroid + size metadata,
- * plus a cache slot for real block positions discovered by the tick-based
- * expansion scan (populated once the cluster's chunk is loaded client-side).
- */
 public final class OreHit {
 
     private final OreType type;
@@ -17,16 +13,10 @@ public final class OreHit {
     private final String size;
     private final String confidence;
 
-    /**
-     * Real block positions inside this cluster, discovered by scanning the loaded
-     * chunk around {@link #pos}. {@code null} means "scan not attempted yet";
-     * empty list means "scanned, nothing found" (cluster mined out or chunk was
-     * only partially loaded when we peeked).
-     */
-    private volatile List<BlockPos> expandedBlocks = null;
-
-    /** True once the scan has run at least once against a loaded chunk. */
-    private volatile boolean scanAttempted = false;
+    // null   = not scanned yet
+    // List.of() = scanned, nothing found (buried / mined / false-positive)
+    // non-empty  = real target blocks discovered by scanCluster
+    private final AtomicReference<List<BlockPos>> expandedBlocks = new AtomicReference<>(null);
 
     public OreHit(OreType type, BlockPos pos, int ores, String size, String confidence) {
         this.type = type;
@@ -42,12 +32,17 @@ public final class OreHit {
     public String size()       { return size; }
     public String confidence() { return confidence; }
 
-    public List<BlockPos> expandedBlocks() { return expandedBlocks; }
-    public boolean scanAttempted()          { return scanAttempted; }
+    public List<BlockPos> expandedBlocks() { return expandedBlocks.get(); }
+    public boolean scanAttempted()          { return expandedBlocks.get() != null; }
 
     public void setExpandedBlocks(List<BlockPos> blocks) {
-        this.expandedBlocks = blocks;
-        this.scanAttempted = true;
+        List<BlockPos> result = List.copyOf(blocks);
+        // First writer wins (null → result). Also allow upgrading an empty result to real
+        // blocks: a partial-chunk scan produces List.of() but a later full scan may find ores.
+        // An empty result is never overwritten with another empty result.
+        if (!expandedBlocks.compareAndSet(null, result)) {
+            if (!result.isEmpty()) expandedBlocks.set(result);
+        }
     }
 
     public boolean isLowConfidence() {
