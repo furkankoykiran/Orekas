@@ -63,6 +63,7 @@ public class OrderSniperModule extends Module {
     // ── Settings ──────────────────────────────────────────────────────────────
 
     private final SettingGroup sgGeneral   = settings.getDefaultGroup();
+    private final SettingGroup sgDelivery  = settings.createGroup("Delivery");
     private final SettingGroup sgBlacklist = settings.createGroup("Blacklist");
     private final SettingGroup sgAdminList = settings.createGroup("Admin List");
 
@@ -97,10 +98,31 @@ public class OrderSniperModule extends Module {
         .min(0).max(20).sliderMax(10)
         .build());
 
+    private final Setting<Integer> cyclePauseTicks = sgGeneral.add(new IntSetting.Builder()
+        .name("cycle-pause-ticks")
+        .description("Ticks to wait between order cycles. Lower = faster refresh, higher = more server-friendly.")
+        .defaultValue(5)
+        .min(1).max(100).sliderMax(40)
+        .build());
+
     private final Setting<Boolean> notifications = sgGeneral.add(new BoolSetting.Builder()
         .name("notifications")
         .description("Show status messages in chat.")
         .defaultValue(true)
+        .build());
+
+    private final Setting<Integer> drainBatchSize = sgDelivery.add(new IntSetting.Builder()
+        .name("batch-size")
+        .description("Inventory slots sent per tick during delivery. Higher = faster, but may desync on laggy servers.")
+        .defaultValue(2)
+        .min(1).max(8).sliderMax(8)
+        .build());
+
+    private final Setting<Integer> drainSettleTicks = sgDelivery.add(new IntSetting.Builder()
+        .name("settle-ticks")
+        .description("Extra ticks to wait after sending the last delivery packet before advancing to confirm. Increase on high-latency servers.")
+        .defaultValue(2)
+        .min(0).max(20).sliderMax(10)
         .build());
 
     private final Setting<List<String>> blacklistedPlayers = sgBlacklist.add(new StringListSetting.Builder()
@@ -158,7 +180,7 @@ public class OrderSniperModule extends Module {
             case WAIT_CONFIRM    -> tickWaitConfirm(now);
             case CONFIRM_SALE    -> tickConfirm(now);
             case FINALIZE        -> tickFinalize(now);
-            case CYCLE_PAUSE     -> { if (elapsed(now) >= delayMs(5)) advance(Stage.REFRESH); }
+            case CYCLE_PAUSE     -> { if (elapsed(now) >= delayMs(cyclePauseTicks.get())) advance(Stage.REFRESH); }
             default              -> {}
         }
     }
@@ -166,6 +188,14 @@ public class OrderSniperModule extends Module {
     // ── Stage implementations ─────────────────────────────────────────────────
 
     private void tickRefresh(long now) {
+        // Guard: if inventory is empty at cycle start, stop rather than opening
+        // the orders GUI pointlessly. Checking here (not in FINALIZE) avoids a
+        // false-stop while items are still in transit inside the deposit chest.
+        if (!hasDeliverableItems()) {
+            if (notifications.get()) info("No more items to deliver. Stopping.");
+            toggle();
+            return;
+        }
         if (mc.currentScreen instanceof GenericContainerScreen screen) {
             // Slot 49 = refresh / navigation button in DonutSMP orders GUI (6-row chest)
             mc.interactionManager.clickSlot(
@@ -251,13 +281,9 @@ public class OrderSniperModule extends Module {
     /**
      * Drains deliverable inventory slots into the deposit chest via QUICK_MOVE.
      *
-     * Batch size is derived from delayTicks:
-     *   0  → 4 slots/tick  (≈full 36-slot inventory in ~9 ticks / 450 ms)
-     *   1  → 2 slots/tick
-     *   2+ → 1 slot/tick   (conservative, for high-latency connections)
-     *
-     * The chest-space check is re-evaluated before each individual transfer so
-     * we stop the moment the deposit side fills up rather than sending redundant packets.
+     * {@code drainBatchSize} slots are sent per tick. The chest-space check is
+     * re-evaluated before each individual transfer so we stop the moment the
+     * deposit side fills up rather than sending redundant packets.
      */
     private void tickDrain(long now) {
         if (!(mc.currentScreen instanceof GenericContainerScreen screen)) {
@@ -267,8 +293,7 @@ public class OrderSniperModule extends Module {
         ScreenHandler h = screen.getScreenHandler();
         PlayerInventory playerInv = mc.player.getInventory();
 
-        int delay = delayTicks.get();
-        int batchSize = delay == 0 ? 4 : delay == 1 ? 2 : 1;
+        int batchSize = drainBatchSize.get();
 
         for (int i = 0; i < batchSize; i++) {
             // Skip non-deliverable slots
@@ -298,7 +323,10 @@ public class OrderSniperModule extends Module {
     }
 
     private void tickWaitConfirm(long now) {
-        if (elapsed(now) < delayMs(Math.max(4, delayTicks.get()))) return;
+        // Base settle + drain-settle: gives the server time to finish processing
+        // all QUICK_MOVE packets sent during DRAIN_INVENTORY.
+        long minWait = delayMs(Math.max(4, delayTicks.get())) + drainSettleTicks.get() * 50L;
+        if (elapsed(now) < minWait) return;
 
         if (mc.currentScreen instanceof GenericContainerScreen) {
             advance(Stage.CONFIRM_SALE);
@@ -329,13 +357,9 @@ public class OrderSniperModule extends Module {
     private void tickFinalize(long now) {
         if (elapsed(now) < delayMs(Math.max(3, delayTicks.get()))) return;
         if (mc.currentScreen != null) mc.player.closeHandledScreen();
-
-        if (!hasDeliverableItems()) {
-            if (notifications.get()) info("No more items to deliver. Stopping.");
-            toggle();
-        } else {
-            advance(Stage.CYCLE_PAUSE);
-        }
+        // Always cycle — the item check happens at REFRESH so we never test
+        // inventory while items are still transitioning through the deposit GUI.
+        advance(Stage.CYCLE_PAUSE);
     }
 
     // ── Utility ───────────────────────────────────────────────────────────────
