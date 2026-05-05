@@ -186,9 +186,17 @@ public class OrderSniperModule extends Module {
     private void tickOpenOrders(long now) {
         // Guard at start of cycle: stop if nothing to deliver
         if (!hasDeliverableItems()) {
-            if (notifications.get()) info("No more items to deliver. Stopping.");
+            if (notifications.get()) {
+                info("No (highlight)%s(default) in inventory. Check the deliver-item setting.",
+                    deliverItem.get().getName().getString());
+            }
             toggle();
             return;
+        }
+        // Close any stale GUI before sending the command so WAIT_GUI always
+        // detects a freshly opened screen rather than the leftover from the last cycle.
+        if (mc.currentScreen instanceof GenericContainerScreen) {
+            mc.player.closeHandledScreen();
         }
         dbg("→ /orders %s", searchQuery.get());
         ChatUtils.sendPlayerMsg("/orders " + searchQuery.get());
@@ -210,7 +218,13 @@ public class OrderSniperModule extends Module {
 
     private void tickScanOrders(long now) {
         if (!(mc.currentScreen instanceof GenericContainerScreen screen)) {
-            if (elapsed(now) > 600) advance(Stage.OPEN_ORDERS);
+            // Screen is briefly null while the server refreshes the orders GUI.
+            // Use the full watchdog timeout so a slow server doesn't trigger a
+            // premature cycle restart.
+            if (elapsed(now) > T_GUI_OPEN) {
+                dbg("scan: screen gone for >%dms, restarting", T_GUI_OPEN);
+                advance(Stage.OPEN_ORDERS);
+            }
             return;
         }
         ScreenHandler h = screen.getScreenHandler();
@@ -373,7 +387,18 @@ public class OrderSniperModule extends Module {
     }
 
     private void dbg(String fmt, Object... args) {
-        if (debug.get()) info("[dbg] " + fmt, args);
+        if (!debug.get()) return;
+        String ts = java.time.LocalTime.now()
+            .format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss.SSS"));
+        info("[dbg %s] " + fmt, prepend(ts, args));
+    }
+
+    /** Prepends a leading element to a vararg array without allocating extra objects. */
+    private static Object[] prepend(Object first, Object[] rest) {
+        Object[] combined = new Object[rest.length + 1];
+        combined[0] = first;
+        System.arraycopy(rest, 0, combined, 1, rest.length);
+        return combined;
     }
 
     private boolean isDeliverable(ItemStack stack) {
