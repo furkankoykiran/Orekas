@@ -8,68 +8,72 @@ import meteordevelopment.meteorclient.systems.modules.Modules;
 import meteordevelopment.meteorclient.utils.player.ChatUtils;
 import meteordevelopment.orbit.EventHandler;
 import net.minecraft.client.gui.screen.ingame.GenericContainerScreen;
+import net.minecraft.component.DataComponentTypes;
+import net.minecraft.component.type.ContainerComponent;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.*;
-import net.minecraft.item.tooltip.TooltipType;
 import net.minecraft.screen.ScreenHandler;
 import net.minecraft.screen.slot.Slot;
 import net.minecraft.screen.slot.SlotActionType;
 import net.minecraft.text.Text;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
  * Fills and confirms DonutSMP player orders automatically.
  *
- * Improvements over the Glazed reference:
- *  - One inventory slot transferred per tick (QUICK_MOVE only) rather than
- *    the broken PICKUP+PICKUP_ALL+QUICK_MOVE spam that leaves the cursor dirty.
- *  - Every stage has a configurable watchdog timeout that cycles instead of
- *    hard-stopping the module.
- *  - Price patterns are precompiled static constants (not rebuilt each call).
- *  - Shulker detection uses translation-key suffix instead of an explicit
- *    17-item enum list.
- *  - `stage` / `stageStart` are volatile so getInfoString() is race-free.
- *  - The GUI sync-ID switch in WAIT_DEPOSIT correctly detects the deposit GUI
- *    even if the orders GUI is still briefly visible.
+ * Key design decisions:
+ *  - All timing is driven by a single "refresh-interval" tick setting — no hidden floors.
+ *  - Order slots are validated (must have a price AND a player name) before clicking to
+ *    prevent accidentally clicking on GUI decoration elements with the same item type.
+ *  - Shulker contents are checked via DataComponentTypes.CONTAINER (not tooltip parsing)
+ *    so the result is authoritative regardless of tooltip display mode.
+ *  - A 1-second per-order cooldown prevents re-attempting the same order immediately
+ *    after a failed cycle.
+ *  - stage/stageStart are volatile so getInfoString() is race-free on the render thread.
  */
 public class OrderSniperModule extends Module {
 
-    // Per-stage watchdog timeouts (ms)
-    private static final long T_WAIT_GUI      = 3_000;
-    private static final long T_SCAN          = 4_000;
-    private static final long T_WAIT_DEPOSIT  = 4_000;
-    private static final long T_WAIT_CONFIRM  = 4_000;
-    private static final long T_CONFIRM       = 3_000;
+    // Watchdog timeouts — these are the MAXIMUM time to wait in each stage before giving up.
+    // They are NOT delays; the module advances as soon as the expected state is observed.
+    private static final long T_GUI_OPEN    = 3_000;   // /orders → GUI appears
+    private static final long T_DEPOSIT     = 4_000;   // order click → deposit GUI appears
+    private static final long T_CONFIRM     = 4_000;   // items sent → confirm GUI appears
+    private static final long T_GLASS       = 3_000;   // confirm GUI open → green glass found
 
     // ── State machine ─────────────────────────────────────────────────────────
 
     private enum Stage {
-        IDLE, REFRESH, OPEN_ORDERS, WAIT_GUI, SCAN_ORDERS,
+        IDLE, OPEN_ORDERS, WAIT_GUI, SCAN_ORDERS,
         WAIT_DEPOSIT, DRAIN_INVENTORY, WAIT_CONFIRM, CONFIRM_SALE,
         FINALIZE, CYCLE_PAUSE
     }
 
-    /** Written by game thread, read by render thread (getInfoString). */
     private volatile Stage stage      = Stage.IDLE;
     private volatile long  stageStart = 0L;
 
-    private int ordersGUISyncId  = -1;  // syncId of the /orders listing GUI
-    private int depositGUISyncId = -1;  // syncId of the deposit GUI
-    private int drainCursor      = 0;   // next inventory index to attempt transfer
+    private int    ordersGUISyncId  = -1;
+    private int    depositGUISyncId = -1;
+    private int    drainCursor      = 0;
+    private String lastSeller       = null;   // seller of the currently-active order
+    private double lastPrice        = 0;      // price of the currently-active order
+
+    /** Fingerprint → epoch-ms of last attempt. Prevents immediate retry of same order. */
+    private final Map<String, Long> recentOrders = new HashMap<>();
 
     // ── Settings ──────────────────────────────────────────────────────────────
 
     private final SettingGroup sgGeneral   = settings.getDefaultGroup();
-    private final SettingGroup sgDelivery  = settings.createGroup("Delivery");
     private final SettingGroup sgBlacklist = settings.createGroup("Blacklist");
     private final SettingGroup sgAdminList = settings.createGroup("Admin List");
 
     private final Setting<String> searchQuery = sgGeneral.add(new StringSetting.Builder()
         .name("search-query")
-        .description("Argument passed to /orders <query>.")
+        .description("Argument for /orders <query>.")
         .defaultValue("diamond")
         .build());
 
@@ -81,28 +85,21 @@ public class OrderSniperModule extends Module {
 
     private final Setting<String> minPrice = sgGeneral.add(new StringSetting.Builder()
         .name("min-price")
-        .description("Minimum order price to accept (e.g. 100, 2.5k, 1m, 1b).")
+        .description("Minimum order price (e.g. 100, 2.5k, 1m, 1b).")
         .defaultValue("1")
         .build());
 
     private final Setting<Boolean> shulkerMode = sgGeneral.add(new BoolSetting.Builder()
         .name("shulker-mode")
-        .description("Also deliver shulker boxes that contain the target item.")
+        .description("Deliver shulker boxes that contain the target item (empty shulkers are skipped).")
         .defaultValue(false)
         .build());
 
-    private final Setting<Integer> delayTicks = sgGeneral.add(new IntSetting.Builder()
-        .name("delay-ticks")
-        .description("Extra tick delay between actions (raise on high-latency connections).")
-        .defaultValue(2)
-        .min(0).max(20).sliderMax(10)
-        .build());
-
-    private final Setting<Integer> cyclePauseTicks = sgGeneral.add(new IntSetting.Builder()
-        .name("cycle-pause-ticks")
-        .description("Ticks to wait between order cycles. Lower = faster refresh, higher = more server-friendly.")
-        .defaultValue(5)
-        .min(1).max(100).sliderMax(40)
+    private final Setting<Integer> refreshInterval = sgGeneral.add(new IntSetting.Builder()
+        .name("refresh-interval")
+        .description("Ticks to wait between cycles and after each GUI interaction. 0 = as fast as possible.")
+        .defaultValue(3)
+        .min(0).max(40).sliderMax(20)
         .build());
 
     private final Setting<Boolean> notifications = sgGeneral.add(new BoolSetting.Builder()
@@ -111,29 +108,21 @@ public class OrderSniperModule extends Module {
         .defaultValue(true)
         .build());
 
-    private final Setting<Integer> drainBatchSize = sgDelivery.add(new IntSetting.Builder()
-        .name("batch-size")
-        .description("Inventory slots sent per tick during delivery. Higher = faster, but may desync on laggy servers.")
-        .defaultValue(2)
-        .min(1).max(8).sliderMax(8)
-        .build());
-
-    private final Setting<Integer> drainSettleTicks = sgDelivery.add(new IntSetting.Builder()
-        .name("settle-ticks")
-        .description("Extra ticks to wait after sending the last delivery packet before advancing to confirm. Increase on high-latency servers.")
-        .defaultValue(2)
-        .min(0).max(20).sliderMax(10)
+    private final Setting<Boolean> debug = sgGeneral.add(new BoolSetting.Builder()
+        .name("debug")
+        .description("Log detailed state transitions and decisions to chat.")
+        .defaultValue(false)
         .build());
 
     private final Setting<List<String>> blacklistedPlayers = sgBlacklist.add(new StringListSetting.Builder()
         .name("blacklisted-players")
-        .description("Orders from these players will be skipped.")
+        .description("Skip orders from these players.")
         .defaultValue(List.of())
         .build());
 
     private final Setting<AdminListModule.Role> adminListRole = sgAdminList.add(new EnumSetting.Builder<AdminListModule.Role>()
         .name("role")
-        .description("How to use the AdminList module: skip admin orders (Blacklist) or only accept admin orders (Whitelist).")
+        .description("Blacklist: skip admin orders. Whitelist: only accept admin orders.")
         .defaultValue(AdminListModule.Role.OFF)
         .build());
 
@@ -149,18 +138,25 @@ public class OrderSniperModule extends Module {
     @Override
     public void onActivate() {
         if (parsePrice(minPrice.get()) < 0) {
-            error("Invalid min-price. Use a number with optional k / m / b suffix.");
+            error("Invalid min-price. Use a number with optional k/m/b suffix.");
             toggle();
             return;
         }
-        ordersGUISyncId = depositGUISyncId = -1;
-        drainCursor = 0;
-        advance(Stage.REFRESH);
+        reset();
+        advance(Stage.OPEN_ORDERS);
     }
 
     @Override
     public void onDeactivate() {
         stage = Stage.IDLE;
+        recentOrders.clear();
+    }
+
+    private void reset() {
+        ordersGUISyncId = depositGUISyncId = -1;
+        drainCursor = 0;
+        lastSeller = null;
+        lastPrice = 0;
     }
 
     // ── Tick handler ──────────────────────────────────────────────────────────
@@ -169,9 +165,9 @@ public class OrderSniperModule extends Module {
     private void onTick(TickEvent.Post event) {
         if (mc.player == null || mc.world == null) return;
         long now = System.currentTimeMillis();
+        pruneRecentOrders(now);
 
         switch (stage) {
-            case REFRESH         -> tickRefresh(now);
             case OPEN_ORDERS     -> tickOpenOrders(now);
             case WAIT_GUI        -> tickWaitGui(now);
             case SCAN_ORDERS     -> tickScanOrders(now);
@@ -180,47 +176,35 @@ public class OrderSniperModule extends Module {
             case WAIT_CONFIRM    -> tickWaitConfirm(now);
             case CONFIRM_SALE    -> tickConfirm(now);
             case FINALIZE        -> tickFinalize(now);
-            case CYCLE_PAUSE     -> { if (elapsed(now) >= delayMs(cyclePauseTicks.get())) advance(Stage.REFRESH); }
+            case CYCLE_PAUSE     -> { if (elapsed(now) >= interval()) advance(Stage.OPEN_ORDERS); }
             default              -> {}
         }
     }
 
-    // ── Stage implementations ─────────────────────────────────────────────────
+    // ── Stage handlers ────────────────────────────────────────────────────────
 
-    private void tickRefresh(long now) {
-        // Guard: if inventory is empty at cycle start, stop rather than opening
-        // the orders GUI pointlessly. Checking here (not in FINALIZE) avoids a
-        // false-stop while items are still in transit inside the deposit chest.
+    private void tickOpenOrders(long now) {
+        // Guard at start of cycle: stop if nothing to deliver
         if (!hasDeliverableItems()) {
             if (notifications.get()) info("No more items to deliver. Stopping.");
             toggle();
             return;
         }
-        if (mc.currentScreen instanceof GenericContainerScreen screen) {
-            // Slot 49 = refresh / navigation button in DonutSMP orders GUI (6-row chest)
-            mc.interactionManager.clickSlot(
-                screen.getScreenHandler().syncId, 49, 1, SlotActionType.QUICK_MOVE, mc.player);
-            if (elapsed(now) > 100) advance(Stage.OPEN_ORDERS);
-        } else {
-            advance(Stage.OPEN_ORDERS);
-        }
-    }
-
-    private void tickOpenOrders(long now) {
+        dbg("→ /orders %s", searchQuery.get());
         ChatUtils.sendPlayerMsg("/orders " + searchQuery.get());
         advance(Stage.WAIT_GUI);
     }
 
     private void tickWaitGui(long now) {
-        // Minimum 4-tick settle (200 ms) is sufficient for most servers;
-        // extra delayTicks allows users to raise it for high-latency connections.
-        if (elapsed(now) < delayMs(Math.max(4, delayTicks.get()))) return;
-
+        // No minimum floor — purely driven by refreshInterval
+        if (elapsed(now) < interval()) return;
         if (mc.currentScreen instanceof GenericContainerScreen screen) {
             ordersGUISyncId = screen.getScreenHandler().syncId;
+            dbg("GUI opened syncId=%d", ordersGUISyncId);
             advance(Stage.SCAN_ORDERS);
-        } else if (elapsed(now) > T_WAIT_GUI) {
-            advance(Stage.OPEN_ORDERS); // retry
+        } else if (elapsed(now) > T_GUI_OPEN) {
+            dbg("GUI timeout, retrying");
+            advance(Stage.OPEN_ORDERS);
         }
     }
 
@@ -239,143 +223,163 @@ public class OrderSniperModule extends Module {
             double price = extractPrice(stack);
             if (price < threshold) continue;
 
+            // Require a player name — decoration elements rarely have order metadata
             String seller = extractPlayerName(stack);
-            if (isBlacklisted(seller)) continue;
-            if (isFilteredByAdminList(seller)) continue;
+            if (seller == null) { dbg("slot %d has price but no seller, skipping", slot.id); continue; }
+            if (isBlacklisted(seller)) { dbg("seller %s blacklisted", seller); continue; }
+            if (isFilteredByAdminList(seller)) { dbg("seller %s filtered by AdminList", seller); continue; }
+
+            // 1-second cooldown: don't re-click an order we just failed on
+            String fingerprint = seller + ":" + (long) price;
+            Long lastAttempt = recentOrders.get(fingerprint);
+            if (lastAttempt != null && now - lastAttempt < 1_000) {
+                dbg("order %s on cooldown (%dms)", fingerprint, now - lastAttempt);
+                continue;
+            }
+
+            lastSeller = seller;
+            lastPrice  = price;
+            recentOrders.put(fingerprint, now);
+            ordersGUISyncId = h.syncId;
 
             mc.interactionManager.clickSlot(h.syncId, slot.id, 0, SlotActionType.PICKUP, mc.player);
-            if (notifications.get()) {
-                info("Sniping order%s for %s",
-                    seller != null ? " from " + seller : "",
-                    formatPrice(price));
-            }
-            ordersGUISyncId = h.syncId;
+            dbg("clicked order slot %d seller=%s price=%s", slot.id, seller, formatPrice(price));
             advance(Stage.WAIT_DEPOSIT);
             return;
         }
 
-        // No acceptable order – nudge the refresh button and restart
-        if (elapsed(now) > T_SCAN) {
-            mc.interactionManager.clickSlot(h.syncId, 49, 1, SlotActionType.QUICK_MOVE, mc.player);
-            advance(Stage.OPEN_ORDERS);
+        if (elapsed(now) > T_GUI_OPEN) {
+            dbg("no matching order, refreshing");
+            advance(Stage.CYCLE_PAUSE);
         }
     }
 
     private void tickWaitDeposit(long now) {
         if (mc.currentScreen instanceof GenericContainerScreen screen) {
             int id = screen.getScreenHandler().syncId;
-            // Server has opened the deposit GUI when the syncId changes
             if (id != ordersGUISyncId) {
                 depositGUISyncId = id;
                 drainCursor = 0;
+                dbg("deposit GUI opened syncId=%d", id);
                 advance(Stage.DRAIN_INVENTORY);
                 return;
             }
         }
-        if (elapsed(now) > T_WAIT_DEPOSIT) {
+        if (elapsed(now) > T_DEPOSIT) {
+            dbg("deposit GUI timeout");
             if (mc.currentScreen != null) mc.player.closeHandledScreen();
             advance(Stage.OPEN_ORDERS);
         }
     }
 
     /**
-     * Drains deliverable inventory slots into the deposit chest via QUICK_MOVE.
-     *
-     * {@code drainBatchSize} slots are sent per tick. The chest-space check is
-     * re-evaluated before each individual transfer so we stop the moment the
-     * deposit side fills up rather than sending redundant packets.
+     * Sends refreshInterval+1 QUICK_MOVE packets per tick.
+     * At refreshInterval=0 we send 4/tick; at refreshInterval=1 we send 2/tick;
+     * at refreshInterval=2+ we send 1/tick. Space is re-checked before each packet.
      */
     private void tickDrain(long now) {
         if (!(mc.currentScreen instanceof GenericContainerScreen screen)) {
+            dbg("drain: screen closed, advancing to confirm");
             advance(Stage.WAIT_CONFIRM);
             return;
         }
         ScreenHandler h = screen.getScreenHandler();
         PlayerInventory playerInv = mc.player.getInventory();
 
-        int batchSize = drainBatchSize.get();
+        int ri = refreshInterval.get();
+        int batch = ri == 0 ? 4 : ri == 1 ? 2 : 1;
 
-        for (int i = 0; i < batchSize; i++) {
-            // Skip non-deliverable slots
+        for (int i = 0; i < batch; i++) {
             while (drainCursor < 36 && !isDeliverable(playerInv.getStack(drainCursor))) {
                 drainCursor++;
             }
             if (drainCursor >= 36) {
+                dbg("drain complete, closing screen");
                 mc.player.closeHandledScreen();
                 advance(Stage.WAIT_CONFIRM);
                 return;
             }
-            // Re-check space before every individual transfer
             boolean chestHasSpace = h.slots.stream()
                 .anyMatch(s -> s.inventory != playerInv && s.getStack().isEmpty());
             if (!chestHasSpace) {
+                dbg("chest full, closing screen");
                 mc.player.closeHandledScreen();
                 advance(Stage.WAIT_CONFIRM);
                 return;
             }
-            int guiSlotId = findGuiSlotId(h, playerInv, drainCursor);
-            if (guiSlotId >= 0) {
-                mc.interactionManager.clickSlot(
-                    h.syncId, guiSlotId, 0, SlotActionType.QUICK_MOVE, mc.player);
+            int guiId = findGuiSlotId(h, playerInv, drainCursor);
+            if (guiId >= 0) {
+                mc.interactionManager.clickSlot(h.syncId, guiId, 0, SlotActionType.QUICK_MOVE, mc.player);
+                dbg("drain slot %d → gui %d", drainCursor, guiId);
             }
             drainCursor++;
         }
     }
 
     private void tickWaitConfirm(long now) {
-        // Base settle + drain-settle: gives the server time to finish processing
-        // all QUICK_MOVE packets sent during DRAIN_INVENTORY.
-        long minWait = delayMs(Math.max(4, delayTicks.get())) + drainSettleTicks.get() * 50L;
-        if (elapsed(now) < minWait) return;
-
+        if (elapsed(now) < interval()) return;
         if (mc.currentScreen instanceof GenericContainerScreen) {
+            dbg("confirm GUI detected");
             advance(Stage.CONFIRM_SALE);
-        } else if (elapsed(now) > T_WAIT_CONFIRM) {
-            // Do not stop; cycle back so the next order is attempted
+        } else if (elapsed(now) > T_CONFIRM) {
+            dbg("confirm GUI timeout, cycling");
             advance(Stage.CYCLE_PAUSE);
         }
     }
 
     private void tickConfirm(long now) {
         if (!(mc.currentScreen instanceof GenericContainerScreen screen)) {
-            if (elapsed(now) > T_CONFIRM) advance(Stage.CYCLE_PAUSE);
+            if (elapsed(now) > T_GLASS) { dbg("glass timeout"); advance(Stage.CYCLE_PAUSE); }
             return;
         }
         ScreenHandler h = screen.getScreenHandler();
         for (Slot slot : h.slots) {
             if (isConfirmGlass(slot.getStack())) {
-                // Click twice for redundancy on high-latency connections
                 mc.interactionManager.clickSlot(h.syncId, slot.id, 0, SlotActionType.PICKUP, mc.player);
                 mc.interactionManager.clickSlot(h.syncId, slot.id, 0, SlotActionType.PICKUP, mc.player);
+                dbg("confirmed sale slot %d", slot.id);
                 advance(Stage.FINALIZE);
                 return;
             }
         }
-        if (elapsed(now) > T_CONFIRM) advance(Stage.CYCLE_PAUSE);
+        if (elapsed(now) > T_GLASS) { dbg("no glass found, cycling"); advance(Stage.CYCLE_PAUSE); }
     }
 
     private void tickFinalize(long now) {
-        if (elapsed(now) < delayMs(Math.max(3, delayTicks.get()))) return;
+        if (elapsed(now) < interval()) return;
         if (mc.currentScreen != null) mc.player.closeHandledScreen();
-        // Always cycle — the item check happens at REFRESH so we never test
-        // inventory while items are still transitioning through the deposit GUI.
+        // Always log the completed sale — user said this should be unconditional
+        if (notifications.get() && lastSeller != null) {
+            info("Sold to (highlight)%s(default) for (highlight)%s", lastSeller, formatPrice(lastPrice));
+        }
         advance(Stage.CYCLE_PAUSE);
     }
 
-    // ── Utility ───────────────────────────────────────────────────────────────
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
     private void advance(Stage next) {
+        dbg("stage %s → %s", stage, next);
         stage      = next;
         stageStart = System.currentTimeMillis();
+        if (next != Stage.DRAIN_INVENTORY) drainCursor = 0;
     }
 
-    private long elapsed(long now)   { return now - stageStart; }
-    private long delayMs(int ticks)  { return ticks * 50L; }
+    private long elapsed(long now) { return now - stageStart; }
+
+    /** Converts refreshInterval ticks to ms. Zero ticks = 1 tick minimum (50 ms). */
+    private long interval() {
+        int ri = refreshInterval.get();
+        return ri <= 0 ? 50L : ri * 50L;
+    }
+
+    private void dbg(String fmt, Object... args) {
+        if (debug.get()) info("[dbg] " + fmt, args);
+    }
 
     private boolean isDeliverable(ItemStack stack) {
         if (stack.isEmpty()) return false;
         if (stack.isOf(deliverItem.get())) return true;
-        return shulkerMode.get() && isShulkerBox(stack) && shulkerHasTarget(stack);
+        return shulkerMode.get() && isShulkerBox(stack) && shulkerContainsTarget(stack);
     }
 
     private boolean hasDeliverableItems() {
@@ -389,13 +393,17 @@ public class OrderSniperModule extends Module {
         return stack.getItem().getTranslationKey().endsWith("shulker_box");
     }
 
-    private boolean shulkerHasTarget(ItemStack shulker) {
-        String name = deliverItem.get().getName().getString().toLowerCase();
-        List<Text> tt = shulker.getTooltip(
-            Item.TooltipContext.create(mc.world), mc.player, TooltipType.BASIC);
-        for (Text line : tt) {
-            String t = line.getString().toLowerCase();
-            if (t.contains(name) || t.contains(name.replace(" ", "_"))) return true;
+    /**
+     * Uses DataComponentTypes.CONTAINER to read shulker contents directly.
+     * This is authoritative — unlike tooltip parsing, it works regardless of
+     * TooltipType and correctly returns false for empty shulkers.
+     */
+    private boolean shulkerContainsTarget(ItemStack shulker) {
+        ContainerComponent c = shulker.get(DataComponentTypes.CONTAINER);
+        if (c == null) return false;
+        Item target = deliverItem.get();
+        for (ItemStack s : c.iterateNonEmpty()) {
+            if (s.isOf(target)) return true;
         }
         return false;
     }
@@ -406,10 +414,6 @@ public class OrderSniperModule extends Module {
                 || stack.isOf(Items.GREEN_STAINED_GLASS_PANE));
     }
 
-    /**
-     * Resolves the GUI slot ID for a player inventory index (0-35).
-     * Uses inventory identity comparison so it works regardless of chest size.
-     */
     private static int findGuiSlotId(ScreenHandler h, PlayerInventory inv, int invIndex) {
         for (Slot s : h.slots) {
             if (s.inventory == inv && s.getIndex() == invIndex) return s.id;
@@ -422,13 +426,6 @@ public class OrderSniperModule extends Module {
         return blacklistedPlayers.get().stream().anyMatch(b -> b.equalsIgnoreCase(name));
     }
 
-    /**
-     * Returns true when this order should be skipped due to AdminList policy.
-     * <ul>
-     *   <li>BLACKLIST – skip orders from admin players.</li>
-     *   <li>WHITELIST – skip orders from non-admin players (only admins accepted).</li>
-     * </ul>
-     */
     private boolean isFilteredByAdminList(String seller) {
         AdminListModule.Role role = adminListRole.get();
         if (role == AdminListModule.Role.OFF) return false;
@@ -438,7 +435,11 @@ public class OrderSniperModule extends Module {
         return role == AdminListModule.Role.BLACKLIST ? isAdmin : !isAdmin;
     }
 
-    // Price patterns – precompiled to avoid per-call regex compilation
+    private void pruneRecentOrders(long now) {
+        recentOrders.entrySet().removeIf(e -> now - e.getValue() > 2_000);
+    }
+
+    // Price extraction — patterns precompiled as constants
     private static final List<Pattern> PRICE_PATTERNS = List.of(
         Pattern.compile("\\$([0-9,]+(?:\\.[0-9]*)?)([kmb])?",             Pattern.CASE_INSENSITIVE),
         Pattern.compile("(?:price|pay|reward)\\s*:\\s*([0-9,]+(?:\\.[0-9]*)?)([kmb])?", Pattern.CASE_INSENSITIVE),
@@ -448,7 +449,8 @@ public class OrderSniperModule extends Module {
 
     private double extractPrice(ItemStack stack) {
         List<Text> tt = stack.getTooltip(
-            Item.TooltipContext.create(mc.world), mc.player, TooltipType.BASIC);
+            Item.TooltipContext.create(mc.world), mc.player,
+            net.minecraft.item.tooltip.TooltipType.BASIC);
         for (Text line : tt) {
             String raw = line.getString().replace(",", "");
             for (Pattern p : PRICE_PATTERNS) {
@@ -475,7 +477,8 @@ public class OrderSniperModule extends Module {
 
     private String extractPlayerName(ItemStack stack) {
         List<Text> tt = stack.getTooltip(
-            Item.TooltipContext.create(mc.world), mc.player, TooltipType.BASIC);
+            Item.TooltipContext.create(mc.world), mc.player,
+            net.minecraft.item.tooltip.TooltipType.BASIC);
         for (Text line : tt) {
             Matcher m = SELLER_RE.matcher(line.getString());
             if (m.find()) return m.group(1);
@@ -502,6 +505,8 @@ public class OrderSniperModule extends Module {
 
     @Override
     public String getInfoString() {
-        return isActive() ? stage.name() : null;
+        if (!isActive()) return null;
+        if (lastSeller != null) return stage.name() + " | " + lastSeller;
+        return stage.name();
     }
 }
